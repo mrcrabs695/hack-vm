@@ -1,6 +1,7 @@
-use std::{io::{BufRead, Error, Seek, SeekFrom, Write}, result};
+use std::{io::{self, BufRead, Error, Seek, SeekFrom, Write}, result};
 
-enum CommandType {
+#[derive(PartialEq, Eq)]
+pub enum CommandType {
     Arithmetic(String),
     Push,
     Pop,
@@ -13,15 +14,15 @@ enum CommandType {
     Empty
 }
 
-
-struct Parser<W: Seek + BufRead> {
+#[derive(Debug)]
+pub struct Parser<W: Seek + BufRead> {
     input: W,
     has_lines_remaining: bool,
     cur_line: Option<String>,
     /// line number not including empty lines or comments
-    line: usize,
+    pub line: usize,
     /// actual line number
-    line_raw: usize
+    pub line_raw: usize
 }
 
 impl<W: Seek + BufRead> Parser<W> {
@@ -33,21 +34,15 @@ impl<W: Seek + BufRead> Parser<W> {
         self.has_lines_remaining
     }
 
-    pub fn advance(&mut self) -> Result<(), String> {
+    pub fn advance(&mut self) -> io::Result<()> {
         let mut next_string = String::new();
         loop {
-            let bytes_read = self.input.read_line(&mut next_string);
-            if bytes_read.as_ref().is_ok_and(|x| x < &1){
+            let bytes_read = self.input.read_line(&mut next_string)?;
+            if bytes_read < 1{
                 self.has_lines_remaining = false;
                 self.cur_line = None;
 
-                return Err("EOF".to_string())
-            }
-            else if bytes_read.as_ref().is_err() {
-                self.has_lines_remaining = false;
-                self.cur_line = None;
-
-                return Err(bytes_read.unwrap_err().to_string());
+                return Err(Error::from(io::ErrorKind::UnexpectedEof));
             }
             else {
                 next_string = next_string.trim().to_string();
@@ -72,7 +67,7 @@ impl<W: Seek + BufRead> Parser<W> {
         }
     }
 
-    pub fn reset(&mut self) -> Result<(), Error> {
+    pub fn reset(&mut self) -> io::Result<()> {
         self.input.seek(SeekFrom::Start(0))?;
 
         Ok(())
@@ -132,7 +127,9 @@ impl<W: Seek + BufRead> Parser<W> {
     }
 }
 
-struct CodeWriter<W: Write> {
+
+#[derive(Debug)]
+pub struct CodeWriter<W: Write> {
     out_stream: W,
 }
 
@@ -142,51 +139,45 @@ impl<W: Write> CodeWriter<W> {
         CodeWriter { out_stream }
     }
 
-    fn map_vreg(register: String) -> String {
+    fn map_vreg(register: &String) -> String {
         match register.as_str() {
             "local" => "LCL".to_string(),
             "argument" => "ARG".to_string(),
             "this" => "THIS".to_string(),
             "that" => "THAT".to_string(),
             "temp" => "TEMP".to_string(),
-            _ => register
+            _ => register.to_owned()
         }
     }
 
-    fn write_decrement_sp() -> String {
+    fn decrement_sp() -> String {
         "@SP\n AM=M-1\n".to_string()
     }
 
-    fn write_pop_d() -> String {
-        let mut result = String::new();
-        result.push_str(Self::write_decrement_sp().as_str());
-        result.push_str(" D=M // pop D\n");
-
-        result
+    fn pop_d() -> String {
+        Self::decrement_sp() + " D=M // pop D\n"
     }
 
-    fn write_pop_a() -> String {
-        let mut result = String::new();
-        result.push_str(Self::write_decrement_sp().as_str());
-        result.push_str(" A=M // pop A\n");
-
-        result
+    /// does not use the D register
+    fn pop_a() -> String {
+        Self::decrement_sp() + " A=M // pop A\n"
     }
 
-    fn write_push_d() -> String {
+    fn push_d() -> String {
         "@SP\n A=M\n M=D\n @SP\n M=M+1 // push D\n".to_string()
+    }
+
+    /// the address to M must be loaded in A first
+    fn push_m() -> String {
+        "D=M\n ".to_owned() + &Self::push_d()
     }
 
     fn load_const(val: i16) -> String {
         format!("@{val}\n D=A\n")
     }
 
-    fn write_push_const(val: i16) -> String {
-        let mut result = String::new();
-        result.push_str(Self::load_const(val).as_str());
-        result.push_str(Self::write_push_d().as_str());
-
-        result
+    fn push_const(val: i16) -> String {
+        Self::load_const(val) + &Self::push_d()
     }
 
     /// sets the A register to the location that THIS or THAT points to
@@ -198,42 +189,139 @@ impl<W: Write> CodeWriter<W> {
             segment = "THAT"
         }
 
-        format!("@{segment}\n A=M\n")
+        format!("@{segment}\n")
     }
 
-    /// sets the A register to the base address of segment + index
-    fn load_vreg_address(segment: String, index: i16) -> String {
+    /// sets target_reg to the base address of segment + index
+    fn load_vreg_address(segment: &String, index: i16, target_reg: char) -> String {
         let segment = Self::map_vreg(segment);
-        format!("@{index}\n D=A\n @{segment}\n A=D+A\n")
+        format!("@{index}\n D=A\n @{segment}\n A=M\n {target_reg}=D+A\n")
     }
 
     /// return an assembly var name that equates to the given namespace and index
-    fn static_var(namespace: String, index: i16) -> String {
-        let namespace = namespace.to_lowercase();
-        todo!()
+    fn static_var(namespace: &String, index: i16) -> String {
+        let namespace = namespace.to_uppercase();
+        format!("{namespace}.{index}")
     }
 
-    fn load_static_address(namespace: String, index: i16) -> String {
+    fn load_static_address(namespace: &String, index: i16) -> String {
         let static_var = Self::static_var(namespace, index);
         
-        format!("@{static_var}")
+        format!("@{static_var}\n")
     }
 
-    pub fn write_push_pop(command: CommandType, segment: String, index: i16) -> String {
-        let result = String::new();
+    pub fn write_push_pop(&mut self, command: CommandType, segment: String, index: i16) -> io::Result<()> {
+        let push_comment = format!("// push {segment} {index}\n\n");
+        let pop_comment = format!("// pop {segment} {index}\n\n");
 
-        match command {
+        let result = match command {
+            CommandType::Push if &segment == "pointer" => {
+                Self::load_pointer_segment(index) +
+                "D=M\n " +
+                &Self::push_d() +
+                &push_comment
+            },
+            CommandType::Push if &segment == "static" => {
+                Self::load_static_address(&"REPLACEME".to_string(), index) +
+                "D=M\n" +
+                &Self::push_d() +
+                &push_comment
+            },
+            CommandType::Push if &segment == "constant" => {
+                Self::push_const(index) +
+                &push_comment
+            },
             CommandType::Push => {
-                todo!()
+                Self::load_vreg_address(&segment, index, 'A') +
+                "D=M\n " +
+                &Self::push_d() +
+                &push_comment
+            },
+            CommandType::Pop if &segment == "pointer" => {
+                Self::pop_d() +
+                &Self::load_pointer_segment(index) +
+                "M=D\n" +
+                &pop_comment
+            },
+            CommandType::Pop if &segment == "static" => {
+                Self::pop_d() +
+                &Self::load_static_address(&"REPLACEME".to_string(), index) +
+                "M=D\n" +
+                &pop_comment
+            },
+            CommandType::Pop if &segment == "constant" => {
+                Self::pop_d() +
+                &format!("@{index}\n M=D\n") +
+                &pop_comment
             },
             CommandType::Pop => {
-                todo!()
+                Self::load_vreg_address(&segment, index, 'D') +
+                "@R13\n M=D\n" +
+                &Self::pop_d() +
+                "@R13\n A=M\n M=D\n" +
+                &pop_comment
             },
-            _ => return String::new()
-        }
+            _ => return Ok(())
+        };
+
+        self.out_stream.write_all(result.as_bytes())?;
+        Ok(())
     }
 
-    pub fn write_arithmetic(&mut self, command: String) -> Result<(), String> {
-        todo!()
+    fn do_stack_op_two(op:String) -> String {
+        Self::pop_d() +
+        &Self::pop_a() +
+        &op + "\n" +
+        &Self::push_d()
+    }
+
+    fn do_stack_op_one(op:String) -> String {
+        Self::pop_d() +
+        &op + "\n" +
+        &Self::push_d()
+    }
+
+    fn do_stack_if_two(op:String, if_op:String, if_not_op:String, label:String, jump:String) -> String {
+        Self::do_stack_op_two(
+            "(IFEQ)\n D=-1\n".to_string() +
+            "D=D-A\n"
+        )
+    }
+
+    pub fn write_arithmetic(&mut self, command: String) -> io::Result<()> {
+        let result = match command.as_str() {
+            "add" => {
+                Self::do_stack_op_two("D=D+A".to_string())
+            }
+            "sub" => {
+                Self::do_stack_op_two("D=D-A".to_string())
+            }
+            "neg" => {
+                Self::do_stack_op_one("D=-D".to_string())
+            }
+            "eq" => {
+                Self::do_stack_op_two(
+                    "(IFEQ)\n D=-1\n".to_string() +
+                    "D=D-A\n"
+                )
+            }
+            "and" => {
+                Self::do_stack_op_two("D=D&A".to_string())
+            }
+            "or" => {
+                Self::do_stack_op_two("D=D|A".to_string())
+            }
+            "not" => {
+                Self::do_stack_op_one("D=!D".to_string())
+            }
+            _ => todo!()
+        };
+
+        self.out_stream.write_all(result.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn write_end(&mut self) -> io::Result<()> {
+        self.out_stream.write_all("(VMEND)\n@VMEND\n0;JMP\n".as_bytes())
     }
 }

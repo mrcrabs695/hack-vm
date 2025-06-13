@@ -1,4 +1,4 @@
-use std::{env, fs::{read, File}, io::{self, Cursor}, path::Path, process};
+use std::{env, ffi::OsStr, fs::{read, File}, io::{self, Cursor}, path::Path, process};
 
 use hack_vm::{CodeWriter, CommandType, Parser};
 
@@ -29,8 +29,13 @@ fn main() {
         process::exit(1);
     });
 
+    // fuckass function, theres gotta be a better way to do this
+    let namespace = input_path.file_name().and_then(|x| Some(String::from(x.to_string_lossy()))).unwrap_or("Default".to_string());
+    let namespace = namespace.strip_suffix(".vm").unwrap_or(&namespace).to_string();
+    println!("{}", namespace);
+
     let mut parser = Parser::new(input_file);
-    let mut writer = CodeWriter::new(output_file);
+    let mut writer = CodeWriter::new(output_file, namespace);
 
     parser.advance().expect("fuck you");
     while parser.has_more_lines() {
@@ -74,6 +79,9 @@ fn main() {
             }
         }
 
-        parser.advance().unwrap_or_else(|x| eprintln!("Error advancing to next line: {}", x));
+        parser.advance().unwrap_or_else(|_| {
+            println!("Finished");
+            writer.write_end().unwrap();
+        });
     }
 }

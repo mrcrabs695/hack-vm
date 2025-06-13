@@ -129,14 +129,15 @@ impl<W: Seek + BufRead> Parser<W> {
 
 
 #[derive(Debug)]
-pub struct CodeWriter<W: Write> {
+pub struct CodeWriter<W: Write + Seek> {
     out_stream: W,
+    namespace: String,
 }
 
-impl<W: Write> CodeWriter<W> {
+impl<W: Write + Seek> CodeWriter<W> {
     
-    pub fn new(out_stream: W) -> CodeWriter<W> {
-        CodeWriter { out_stream }
+    pub fn new(out_stream: W, namespace: String) -> CodeWriter<W> {
+        CodeWriter { out_stream, namespace }
     }
 
     fn map_vreg(register: &String) -> String {
@@ -145,7 +146,6 @@ impl<W: Write> CodeWriter<W> {
             "argument" => "ARG".to_string(),
             "this" => "THIS".to_string(),
             "that" => "THAT".to_string(),
-            "temp" => "TEMP".to_string(),
             _ => register.to_owned()
         }
     }
@@ -222,7 +222,7 @@ impl<W: Write> CodeWriter<W> {
                 &push_comment
             },
             CommandType::Push if &segment == "static" => {
-                Self::load_static_address(&"REPLACEME".to_string(), index) +
+                Self::load_static_address(&self.namespace, index) +
                 "D=M\n" +
                 &Self::push_d() +
                 &push_comment
@@ -231,6 +231,17 @@ impl<W: Write> CodeWriter<W> {
                 Self::push_const(index) +
                 &push_comment
             },
+            CommandType::Push if &segment == "temp" => {
+                let mut error_comment = "";
+                if index > 7 {
+                    error_comment = "// Warning: access to segment 'temp' above index 7 will cause overflow related errors\n";
+                    eprint!("{}", error_comment);
+                }
+                Self::load_const(index) +
+                "@5\n A=D+A\n D=M\n" +
+                &Self::push_d() +
+                &push_comment + error_comment
+            }
             CommandType::Push => {
                 Self::load_vreg_address(&segment, index, 'A') +
                 "D=M\n " +
@@ -245,7 +256,7 @@ impl<W: Write> CodeWriter<W> {
             },
             CommandType::Pop if &segment == "static" => {
                 Self::pop_d() +
-                &Self::load_static_address(&"REPLACEME".to_string(), index) +
+                &Self::load_static_address(&self.namespace, index) +
                 "M=D\n" +
                 &pop_comment
             },
@@ -254,6 +265,19 @@ impl<W: Write> CodeWriter<W> {
                 &format!("@{index}\n M=D\n") +
                 &pop_comment
             },
+            CommandType::Pop if &segment == "temp" => {
+                let mut error_comment = "";
+                if index > 7 {
+                    error_comment = "// Warning: access to segment 'temp' above index 7 will cause overflow related errors\n";
+                    eprint!("{}", error_comment);
+                }
+
+                Self::load_const(index) +
+                "@5\n D=D+A\n @R13\n M=D\n" +
+                &Self::pop_d() +
+                "@R13\n A=M\n M=D\n" +
+                &pop_comment + error_comment
+            }
             CommandType::Pop => {
                 Self::load_vreg_address(&segment, index, 'D') +
                 "@R13\n M=D\n" +
@@ -281,11 +305,15 @@ impl<W: Write> CodeWriter<W> {
         &Self::push_d()
     }
 
-    fn do_stack_if_two(op:String, if_op:String, if_not_op:String, label:String, jump:String) -> String {
+    fn do_compare_stack_two(&mut self, jump_op:String) -> String {
+        let current_pos = self.out_stream.seek(SeekFrom::Current(0)).expect("should not do anything but return current pos");
         Self::do_stack_op_two(
-            "(IFEQ)\n D=-1\n".to_string() +
-            "D=D-A\n"
-        )
+            format!(
+                "D=D-A\n @IF{if_label}\n D;{jump_op}\n D=0\n @ENDIF{endif_label}\n 0;JMP\n (IF{if_label})\n D=-1\n (ENDIF{endif_label})\n",
+                if_label = current_pos,
+                endif_label = current_pos + 1
+            )
+        ) + "// if then\n"
     }
 
     pub fn write_arithmetic(&mut self, command: String) -> io::Result<()> {
@@ -294,16 +322,19 @@ impl<W: Write> CodeWriter<W> {
                 Self::do_stack_op_two("D=D+A".to_string())
             }
             "sub" => {
-                Self::do_stack_op_two("D=D-A".to_string())
+                Self::do_stack_op_two("D=A-D".to_string())
             }
             "neg" => {
                 Self::do_stack_op_one("D=-D".to_string())
             }
             "eq" => {
-                Self::do_stack_op_two(
-                    "(IFEQ)\n D=-1\n".to_string() +
-                    "D=D-A\n"
-                )
+                self.do_compare_stack_two("JEQ".to_string())
+            }
+            "gt" => {
+                self.do_compare_stack_two("JLT".to_string())
+            }
+            "lt" => {
+                self.do_compare_stack_two("JGT".to_string())
             }
             "and" => {
                 Self::do_stack_op_two("D=D&A".to_string())
@@ -314,7 +345,7 @@ impl<W: Write> CodeWriter<W> {
             "not" => {
                 Self::do_stack_op_one("D=!D".to_string())
             }
-            _ => todo!()
+            _ => panic!("Unexpected arithmetic command encountered: {}", command)
         };
 
         self.out_stream.write_all(result.as_bytes())?;

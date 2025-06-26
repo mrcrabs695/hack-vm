@@ -37,7 +37,7 @@ fn main() {
     let mut parser = Parser::new(input_file);
     let mut writer = CodeWriter::new(output_file, namespace);
 
-    parser.advance().expect("fuck you");
+    parser.advance().expect("the parser should be able to advance the first line if everything is functioning as expected");
     while parser.has_more_lines() {
         let command_type = parser.command_type();
         

@@ -1,7 +1,4 @@
-use std::{
-    io::{self, BufRead, Error, Seek, SeekFrom, Write},
-    result,
-};
+use std::io::{self, BufRead, Error, Seek, SeekFrom, Write};
 
 #[derive(PartialEq, Eq)]
 pub enum CommandType {
@@ -33,9 +30,9 @@ pub struct Parser<W: Seek + BufRead> {
 #[derive(Debug)]
 pub enum LabelType {
     Static,
-    FunctionLabel(String),
-    FunctionCall(String),
-    FunctionRet(String),
+    FunctionLabel,
+    FunctionCall,
+    FunctionRet,
 }
 
 impl<W: Seek + BufRead> Parser<W> {
@@ -112,20 +109,21 @@ impl<W: Seek + BufRead> Parser<W> {
 
     pub fn command_type(&self) -> CommandType {
         let split_line = self.split_command();
-        let command = split_line.get(0).expect("index zero should exist");
+        let command = split_line.first().expect("index zero should exist");
 
         let result = Parser::<W>::match_arithmetic(command.to_string());
-        if result.is_some() {
-            return result.expect("uhh");
-        }
+        if let Some(item) = result {
+            return item;
+        };
 
-        match command {
-            &"push" => return CommandType::Push,
-            &"pop" => return CommandType::Pop,
+        match *command {
+            "push" => CommandType::Push,
+            "pop" => CommandType::Pop,
+            "label" => CommandType::Label,
+            "goto" => CommandType::Goto,
+            "if-goto" => CommandType::If,
             _ => todo!(),
         }
-
-        CommandType::Empty
     }
 
     pub fn arg1(&self) -> Option<String> {
@@ -134,15 +132,11 @@ impl<W: Seek + BufRead> Parser<W> {
             _ => 1,
         };
 
-        self.split_command()
-            .get(index)
-            .and_then(|x| Some(x.to_string()))
+        self.split_command().get(index).map(|x| x.to_string())
     }
 
     pub fn arg2(&self) -> Option<String> {
-        self.split_command()
-            .get(2)
-            .and_then(|x| Some(x.to_string()))
+        self.split_command().get(2).map(|x| x.to_string())
     }
 }
 
@@ -150,7 +144,7 @@ impl<W: Seek + BufRead> Parser<W> {
 pub struct CodeWriter<W: Write + Seek> {
     out_stream: W,
     namespace: String,
-    cur_func: Option<String>,
+    cur_func: String,
     call_count: usize,
 }
 
@@ -159,9 +153,14 @@ impl<W: Write + Seek> CodeWriter<W> {
         CodeWriter {
             out_stream,
             namespace,
-            cur_func: None,
+            cur_func: String::new(),
             call_count: 0,
         }
+    }
+
+    pub fn set_namespace(&mut self, new_namespace: String) {
+        println!("Translating new file: {new_namespace}");
+        self.namespace = new_namespace;
     }
 
     fn map_vreg(register: &String) -> String {
@@ -192,6 +191,7 @@ impl<W: Write + Seek> CodeWriter<W> {
     }
 
     /// the address to M must be loaded in A first
+    #[allow(dead_code)]
     fn push_m() -> String {
         "D=M\n ".to_owned() + &Self::push_d()
     }
@@ -206,33 +206,32 @@ impl<W: Write + Seek> CodeWriter<W> {
 
     /// sets the A register to the location that THIS or THAT points to
     fn load_pointer_segment(index: i16) -> String {
-        let segment;
-        if index == 0 {
-            segment = "THIS"
-        } else {
-            segment = "THAT"
-        }
+        let segment = if index == 0 { "THIS" } else { "THAT" };
 
         format!("@{segment}\n")
     }
     /// returns an assembly label formatted for use in the VM
-    ///
-    fn get_label(&mut self, label_type: LabelType, label_name: Option<String>) -> String {
-        let label_name = label_name.unwrap_or_default();
+    fn get_label(&mut self, label_type: LabelType, label_name: Option<&String>) -> String {
+        let label_name = if let Some(label) = label_name {
+            label
+        } else {
+            &String::new()
+        };
         let namespace = &self.namespace;
+        let function_name = &self.cur_func;
 
-        return match label_type {
+        match label_type {
             LabelType::Static => format!("{namespace}.{label_name}"),
-            LabelType::FunctionCall(function_name) => format!("{namespace}.{function_name}"),
-            LabelType::FunctionRet(function_name) => {
+            LabelType::FunctionCall => format!("{namespace}.{function_name}"),
+            LabelType::FunctionRet => {
                 let call_count = self.call_count;
                 self.call_count += 1;
                 format!("{namespace}.{function_name}$ret.{call_count}")
             }
-            LabelType::FunctionLabel(function_name) => {
+            LabelType::FunctionLabel => {
                 format!("{namespace}.{function_name}${label_name}")
             }
-        };
+        }
     }
 
     /// sets target_reg to the base address of segment + index
@@ -242,7 +241,7 @@ impl<W: Write + Seek> CodeWriter<W> {
     }
 
     fn load_static_address(&mut self, index: i16) -> String {
-        let static_var = self.get_label(LabelType::Static, Some(index.to_string()));
+        let static_var = self.get_label(LabelType::Static, Some(&index.to_string()));
 
         format!("@{static_var}\n")
     }
@@ -330,8 +329,8 @@ impl<W: Write + Seek> CodeWriter<W> {
     fn do_compare_stack_two(&mut self, jump_op: String) -> String {
         let current_pos = self
             .out_stream
-            .seek(SeekFrom::Current(0))
-            .expect("should not do anything but return current pos");
+            .stream_position()
+            .expect("Getting the position should work ath this stage");
         Self::do_stack_op_two(
             format!(
                 "D=D-A\n @IF{if_label}\n D;{jump_op}\n D=0\n @ENDIF{endif_label}\n 0;JMP\n (IF{if_label})\n D=-1\n (ENDIF{endif_label})\n",
@@ -357,6 +356,27 @@ impl<W: Write + Seek> CodeWriter<W> {
 
         self.out_stream.write_all(result.as_bytes())?;
         Ok(())
+    }
+
+    pub fn write_label(&mut self, label_name: String) -> io::Result<()> {
+        let label = self.get_label(LabelType::FunctionLabel, Some(&label_name));
+        self.out_stream.write_all(format!("({label})\n").as_bytes())
+    }
+
+    pub fn write_goto(&mut self, label_name: String) -> io::Result<()> {
+        let label = self.get_label(LabelType::FunctionLabel, Some(&label_name));
+
+        let output = format!("@{label}\n 0;JMP\n");
+        self.out_stream.write_all(output.as_bytes())
+    }
+
+    pub fn write_ifgoto(&mut self, label_name: String) -> io::Result<()> {
+        let label = self.get_label(LabelType::FunctionLabel, Some(&label_name));
+
+        let output =
+            Self::pop_d() + &format!("@{label}\n D;JNQ\n") + &format!("// if-goto {label_name}\n");
+
+        self.out_stream.write_all(output.as_bytes())
     }
 
     pub fn write_init(&mut self) -> io::Result<()> {

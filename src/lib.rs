@@ -84,6 +84,16 @@ impl<W: Seek + BufRead> Parser<W> {
 
     pub fn reset(&mut self) -> io::Result<()> {
         self.input.seek(SeekFrom::Start(0))?;
+        self.line = 0;
+        self.line_raw = 0;
+        self.cur_line = None;
+
+        Ok(())
+    }
+
+    pub fn set_file(&mut self, file: W) -> io::Result<()> {
+        self.input = file;
+        self.reset()?;
 
         Ok(())
     }
@@ -122,6 +132,9 @@ impl<W: Seek + BufRead> Parser<W> {
             "label" => CommandType::Label,
             "goto" => CommandType::Goto,
             "if-goto" => CommandType::If,
+            "call" => CommandType::Call,
+            "function" => CommandType::Function,
+            "return" => CommandType::Return,
             _ => todo!(),
         }
     }
@@ -149,18 +162,21 @@ pub struct CodeWriter<W: Write + Seek> {
 }
 
 impl<W: Write + Seek> CodeWriter<W> {
-    pub fn new(out_stream: W, namespace: String) -> CodeWriter<W> {
+    pub fn new(out_stream: W) -> CodeWriter<W> {
         CodeWriter {
             out_stream,
-            namespace,
+            namespace: String::new(),
             cur_func: String::new(),
             call_count: 0,
         }
     }
 
     pub fn set_namespace(&mut self, new_namespace: String) {
-        println!("Translating new file: {new_namespace}");
         self.namespace = new_namespace;
+    }
+
+    pub fn get_namespace(&self) -> &String {
+        &self.namespace
     }
 
     fn map_vreg(register: &String) -> String {
@@ -196,12 +212,18 @@ impl<W: Write + Seek> CodeWriter<W> {
         "D=M\n ".to_owned() + &Self::push_d()
     }
 
+    /// loads val into D
     fn load_const(val: i16) -> String {
         format!("@{val}\n D=A\n")
     }
 
+    /// pushes val onto the stack
     fn push_const(val: i16) -> String {
         Self::load_const(val) + &Self::push_d()
+    }
+    /// gets the value of M value of label_name and pushes onto the stack
+    fn push_label(label_name: &str) -> String {
+        format!("@{label_name}\n") + &Self::push_m()
     }
 
     /// sets the A register to the location that THIS or THAT points to
@@ -239,13 +261,14 @@ impl<W: Write + Seek> CodeWriter<W> {
         let segment = Self::map_vreg(segment);
         format!("@{index}\n D=A\n @{segment}\n A=M\n {target_reg}=D+A\n")
     }
-
+    /// calculates the label for the static value at index and loads it into A
     fn load_static_address(&mut self, index: i16) -> String {
         let static_var = self.get_label(LabelType::Static, Some(&index.to_string()));
 
         format!("@{static_var}\n")
     }
 
+    /// writes a push or pop VM command to out_stream
     pub fn write_push_pop(
         &mut self,
         command: CommandType,
@@ -317,15 +340,18 @@ impl<W: Write + Seek> CodeWriter<W> {
         self.out_stream.write_all(result.as_bytes())?;
         Ok(())
     }
-
+    /// pops the bottom two values of the stack and performs the given operation on them, pushing
+    /// the result back onto the stack
     fn do_stack_op_two(op: String) -> String {
         Self::pop_d() + &Self::pop_a() + &op + "\n" + &Self::push_d()
     }
-
+    /// pops the bottom value of the stack and performs the given operation on it, pushing the
+    /// result back onto the stack
     fn do_stack_op_one(op: String) -> String {
         Self::pop_d() + &op + "\n" + &Self::push_d()
     }
-
+    /// compares the bottom two values on the stack using the assembly jump_op given, pushing
+    /// true(1) if the jump_op condition is met or false(0) otherwise
     fn do_compare_stack_two(&mut self, jump_op: String) -> String {
         let current_pos = self
             .out_stream
@@ -340,6 +366,7 @@ impl<W: Write + Seek> CodeWriter<W> {
         ) + "// if then\n"
     }
 
+    /// writes the provided VM arithmetic command to the out_stream
     pub fn write_arithmetic(&mut self, command: String) -> io::Result<()> {
         let result = match command.as_str() {
             "add" => Self::do_stack_op_two("D=D+A".to_string()),
@@ -358,32 +385,117 @@ impl<W: Write + Seek> CodeWriter<W> {
         Ok(())
     }
 
+    /// writes the `label` VM command to the out_stream
     pub fn write_label(&mut self, label_name: String) -> io::Result<()> {
+        let comment = format!("// label {label_name}\n");
         let label = self.get_label(LabelType::FunctionLabel, Some(&label_name));
-        self.out_stream.write_all(format!("({label})\n").as_bytes())
+        self.out_stream
+            .write_all(format!("({label})\n{comment}").as_bytes())
     }
-
+    /// writes the `goto` VM command to the out_stream
     pub fn write_goto(&mut self, label_name: String) -> io::Result<()> {
+        let comment = format!("// goto {label_name}\n");
         let label = self.get_label(LabelType::FunctionLabel, Some(&label_name));
 
-        let output = format!("@{label}\n 0;JMP\n");
+        let output = format!("@{label}\n 0;JMP\n{comment}");
+        self.out_stream.write_all(output.as_bytes())
+    }
+    /// writes the `if-goto` VM command to the out_stream
+    pub fn write_if(&mut self, label_name: String) -> io::Result<()> {
+        let comment = format!("// if-goto {label_name}\n");
+        let label = self.get_label(LabelType::FunctionLabel, Some(&label_name));
+
+        let output = Self::pop_d() + &format!("@{label}\n D;JNE\n") + &comment;
+
         self.out_stream.write_all(output.as_bytes())
     }
 
-    pub fn write_ifgoto(&mut self, label_name: String) -> io::Result<()> {
-        let label = self.get_label(LabelType::FunctionLabel, Some(&label_name));
-
-        let output =
-            Self::pop_d() + &format!("@{label}\n D;JNQ\n") + &format!("// if-goto {label_name}\n");
-
-        self.out_stream.write_all(output.as_bytes())
+    /// set reg to temp_var i
+    fn get_temp_var(i: usize, reg: &str) -> String {
+        let i_str = i.to_string();
+        format!("@R{i_str}\n{reg}=M\n") // get temp_var i and set reg to that value
     }
 
+    /// store D in temp_var i
+    fn store_temp_var(i: usize) -> String {
+        let i_str = i.to_string();
+        format!("@R{i_str}\nM=D\n")
+    }
+
+    /// writes the `return` VM command to the out_stream
+    pub fn write_return(&mut self) -> io::Result<()> {
+        let comment = "// return\n";
+        let result = "@LCL\nD=M\n".to_owned()
+            + &Self::store_temp_var(13) // R13 is frame
+            + "@5\nD=D-A\n" // D = frame-5
+            + &Self::store_temp_var(14) // R14 is ret_address
+
+            + &Self::pop_d() // get the return value
+            + "@ARG\nA=M\nM=D\n" // set head of callee stack to be the return value
+            + "D=A\n@SP\nM=D+1\n" // set SP to ARG + 1 (new head containing the return value)
+
+            + &Self::get_temp_var(13, "D")
+            + "A=D-1\nD=M\n@THAT\nM=D\n" // restore THAT
+
+            + &Self::get_temp_var(13, "D")
+            + "@2\nA=D-A\nD=M\n@THIS\nM=D\n" // restore THIS
+
+            + &Self::get_temp_var(13, "D")
+            + "@3\nA=D-A\nD=M\n@ARG\nM=D\n" // restore ARG
+
+            + &Self::get_temp_var(13, "D")
+            + "@4\nA=D-A\nD=M\n@LCL\nM=D\n" // restore LCL
+
+            + &Self::get_temp_var(14, "A")
+            + "0;JMP\n" // jump to ret_address
+            + comment;
+
+        self.out_stream.write_all(result.as_bytes())
+    }
+
+    /// writes the `call` VM command to the out_stream
+    pub fn write_call(&mut self, function_name: String, n_vars: i16) -> io::Result<()> {
+        let ret_address = self.get_label(LabelType::FunctionRet, Some(&function_name));
+        let n_vars_str = n_vars.to_string();
+        let comment = format!("// call {function_name} {n_vars_str}\n");
+        let result = format!("@{ret_address}\nD=A\n") + &Self::push_d()
+            + &Self::push_label("LCL")
+            + &Self::push_label("ARG")
+            + &Self::push_label("THIS")
+            + &Self::push_label("THAT")
+            + "@SP\nD=M\n@5\nD=D-A\n" // D = SP-5 (SP before the previous stack frame was pushed)
+            + &format!("@{n_vars_str}\nD=D-A\n") // D = SP-n_vars (SP before the args for this function got added)
+            + "@ARG\nM=D\n" // ARG = D (args can now be gotten by 'pop argument i')
+            + "@SP\nD=M\n@LCL\nM=D\n" // LCL = SP
+            + &format!("@{function_name}\n0;JMP\n") // goto function
+            + &format!("({ret_address})\n") // sets the ret_address label
+            + &comment;
+
+        self.out_stream.write_all(result.as_bytes())
+    }
+
+    pub fn write_function(&mut self, function_name: String, n_vars: i16) -> io::Result<()> {
+        let mut result = format!("({function_name})\n");
+        let n_vars_str = n_vars.to_string();
+        let comment = format!("// function {function_name} {n_vars_str}\n");
+
+        let mut i = 0;
+        while i < n_vars {
+            result.push_str(Self::push_const(0).as_str());
+            i += 1;
+        }
+        result.push_str(comment.as_str());
+
+        self.out_stream.write_all(result.as_bytes())
+    }
+
+    /// setup assembly for setting the stack pointer and jumps to the `Sys.init`
     pub fn write_init(&mut self) -> io::Result<()> {
         self.out_stream
             .write_all("@256\nD=A\n@SP\nM=D\n@Sys.init\n0;JMP\n".as_bytes())
     }
 
+    /// writes a neverending loop to the out_stream
     pub fn write_end(&mut self) -> io::Result<()> {
         self.out_stream
             .write_all("(VMEND)\n@VMEND\n0;JMP\n".as_bytes())

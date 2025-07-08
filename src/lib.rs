@@ -1,5 +1,7 @@
 use std::io::{self, BufRead, Error, Seek, SeekFrom, Write};
 
+// this might be the first project of mine that i have used this many comments for lol
+
 #[derive(PartialEq, Eq)]
 pub enum CommandType {
     Arithmetic(String),
@@ -26,13 +28,15 @@ pub struct Parser<W: Seek + BufRead> {
 }
 
 /// Defines the VM label type for translating into assembly labels
-/// The contained string defines the `namespace` the label exists in (ie. (VmFunction.LabelName))
+/// The contained string defines the `namespace` the label exists in (ie. `(VmFunction.LabelName)`)
 #[derive(Debug)]
 pub enum LabelType {
     Static,
     FunctionLabel,
     FunctionCall,
     FunctionRet,
+    CompareTrue,
+    CompareFalse,
 }
 
 impl<W: Seek + BufRead> Parser<W> {
@@ -159,6 +163,7 @@ pub struct CodeWriter<W: Write + Seek> {
     namespace: String,
     cur_func: String,
     call_count: usize,
+    compare_count: usize,
 }
 
 impl<W: Write + Seek> CodeWriter<W> {
@@ -168,6 +173,7 @@ impl<W: Write + Seek> CodeWriter<W> {
             namespace: String::new(),
             cur_func: String::new(),
             call_count: 0,
+            compare_count: 0,
         }
     }
 
@@ -212,6 +218,23 @@ impl<W: Write + Seek> CodeWriter<W> {
         "D=M\n ".to_owned() + &Self::push_d()
     }
 
+    fn push_locals(n_vars: i16) -> String {
+        if n_vars == 0 {
+            return String::new();
+        }
+
+        let mut result = format!("@{n_vars}\nD=A\n@SP\nA=M\n");
+        let mut i = 0;
+
+        while i < n_vars {
+            result.push_str("M=0\nA=A+1\n");
+            i += 1;
+        }
+        result.push_str("@SP\nM=D+M\n");
+
+        result
+    }
+
     /// loads val into D
     fn load_const(val: i16) -> String {
         format!("@{val}\n D=A\n")
@@ -252,6 +275,26 @@ impl<W: Write + Seek> CodeWriter<W> {
             }
             LabelType::FunctionLabel => {
                 format!("{namespace}.{function_name}${label_name}")
+            }
+
+            // this came about due to me desperately trying to figure out what was wrong with the
+            // code and why the compare test wouldn't work, onlt to find out it's the test checking
+            // the wrong RAM locations and my implementation works just fine 💀
+            LabelType::CompareFalse => {
+                let call_count = self.call_count;
+                let compare_count = self.compare_count;
+                self.compare_count += 1;
+                format!(
+                    "{namespace}.{function_name}${label_name}$F_{compare_count}_func{call_count}"
+                )
+            }
+            LabelType::CompareTrue => {
+                let call_count = self.call_count;
+                let compare_count = self.compare_count;
+                self.compare_count += 1;
+                format!(
+                    "{namespace}.{function_name}${label_name}$T_{compare_count}_func{call_count}"
+                )
             }
         }
     }
@@ -353,15 +396,12 @@ impl<W: Write + Seek> CodeWriter<W> {
     /// compares the bottom two values on the stack using the assembly jump_op given, pushing
     /// true(1) if the jump_op condition is met or false(0) otherwise
     fn do_compare_stack_two(&mut self, jump_op: String) -> String {
-        let current_pos = self
-            .out_stream
-            .stream_position()
-            .expect("Getting the position should work ath this stage");
+        let label = format!("{jump_op}COMP");
+        let label_true = self.get_label(LabelType::CompareTrue, Some(&label));
+        let label_false = self.get_label(LabelType::CompareFalse, Some(&label));
         Self::do_stack_op_two(
             format!(
-                "D=D-A\n @IF{if_label}\n D;{jump_op}\n D=0\n @ENDIF{endif_label}\n 0;JMP\n (IF{if_label})\n D=-1\n (ENDIF{endif_label})\n",
-                if_label = current_pos,
-                endif_label = current_pos + 1
+                "D=D-A\n @{label_true}\n D;{jump_op}\n D=0\n @END{label_false}\n 0;JMP\n ({label_true})\n D=-1\n (END{label_false})\n"
             )
         ) + "// if then\n"
     }
@@ -427,7 +467,7 @@ impl<W: Write + Seek> CodeWriter<W> {
         let comment = "// return\n";
         let result = "@LCL\nD=M\n".to_owned()
             + &Self::store_temp_var(13) // R13 is frame
-            + "@5\nD=D-A\n" // D = frame-5
+            + "@5\nA=D-A\nD=M\n" // D = *(frame-5)
             + &Self::store_temp_var(14) // R14 is ret_address
 
             + &Self::pop_d() // get the return value
@@ -474,17 +514,13 @@ impl<W: Write + Seek> CodeWriter<W> {
         self.out_stream.write_all(result.as_bytes())
     }
 
-    pub fn write_function(&mut self, function_name: String, n_vars: i16) -> io::Result<()> {
+    pub fn write_function(&mut self, function_name: String, n_locals: i16) -> io::Result<()> {
         let mut result = format!("({function_name})\n");
-        let n_vars_str = n_vars.to_string();
-        let comment = format!("// function {function_name} {n_vars_str}\n");
+        let n_locals_str = n_locals.to_string();
+        let comment = format!("// function {function_name} {n_locals_str}\n");
 
-        let mut i = 0;
-        while i < n_vars {
-            result.push_str(Self::push_const(0).as_str());
-            i += 1;
-        }
-        result.push_str(comment.as_str());
+        result.push_str(&Self::push_locals(n_locals));
+        result.push_str(&comment);
 
         self.out_stream.write_all(result.as_bytes())
     }
